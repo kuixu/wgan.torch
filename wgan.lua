@@ -2,6 +2,7 @@ require 'torch'
 require 'nn'
 require 'optim'
 require 'math'
+require 'hdf5'
 
 opt = {
    dataset = 'lsun',       -- cifar10 / imagenet / lsun / folder /lfw
@@ -24,10 +25,10 @@ opt = {
    clamp_lower = -0.01,    
    clamp_upper = 0.01, 
    ntrain = math.huge,     -- #  of examples per epoch. math.huge for full dataset
-   display = 1,            -- display samples while training. 0 = false
+   display = 0,            -- display samples while training. 0 = false
    display_id = 10,        -- display window id.
    gpu = 1,                -- gpu = 0 is CPU mode. gpu=X is GPU mode on GPU X
-   name = 'experiment1',
+   name = 'wgan2',
    noise = 'normal',       -- uniform / normal
    n_extra_layers = 0,     -- Number of extra layers on gen and disc
 }
@@ -45,8 +46,14 @@ torch.setdefaulttensortype('torch.FloatTensor')
 
 -- create data loader
 
-local DataLoader = paths.dofile('data/data.lua')
-local data = DataLoader.new(opt.nThreads, opt.dataset, opt)
+--local DataLoader = paths.dofile('data/data.lua')
+--local data = DataLoader.new(opt.nThreads, opt.dataset, opt)
+
+local lfwHd5 = hdf5.open('datasets/lfw.hdf5', 'r')
+local data = lfwHd5:read('lfw'):all()
+data:mul(2):add(-1)
+lfwHd5:close()
+
 print("Dataset: " .. opt.dataset, " Size: ", data:size())
 
 ----------------------------------------------------------------------------
@@ -118,7 +125,7 @@ netD:add(SpatialConvolution(ndf * 4, ndf * 8, 4, 4, 2, 2, 1, 1))
 netD:add(SpatialBatchNormalization(ndf * 8)):add(nn.LeakyReLU(0.2, true))
 -- state size: (ndf*8) x 4 x 4
 netD:add(SpatialConvolution(ndf * 8, 1, 4, 4))
---WGAN netD:add(nn.Sigmoid())
+--netD:add(nn.Sigmoid())
 -- state size: 1 x 1 x 1
 netD:add(nn.View(1):setNumInputDims(3))
 -- state size: 1
@@ -142,8 +149,12 @@ local epoch_tm = torch.Timer()
 local tm = torch.Timer()
 local data_tm = torch.Timer()
 
-local one = torch.Tensor({1})
+local one = torch.Tensor(64, 1):fill(1)
+--print("one size", one:size())
+--print("one", one)
 local mone = one * -1
+--print("mone size", mone:size())
+--print("mone", mone)
 
 --------------------------------------------------------------------
 --RMSProp
@@ -160,7 +171,7 @@ optimStateD = {
 if opt.gpu > 0 then
    require 'cunn'
    cutorch.setDevice(opt.gpu)
-   input = input:cuda();  noise = noise:cuda();  label = label:cuda()
+   input = input:cuda();  noise = noise:cuda();  label = label:cuda(); one = one:cuda();  mone = mone:cuda()
 
    if pcall(require, 'cudnn') then
       require 'cudnn'
@@ -191,15 +202,19 @@ local fDx = function(x)
    gradParametersD:zero()
 
    -- train with real
-   data_tm:reset(); data_tm:resume()
-   local real = data:getBatch()
-   data_tm:stop()
-   input:copy(real)
+   --data_tm:reset(); data_tm:resume()
+   --local real = data:getBatch()
+   --data_tm:stop()
+   --input:copy(real)
    label:fill(real_label)
 
    local output = netD:forward(input)
-   local errD_real = output    --log(D(X))*1+log(1-D(X))*(1-1)  -- error f(x) = y
+   --print ("outputD size:", output:size())
+   local errD_real = torch.mean(output)    --log(D(X))*1+log(1-D(X))*(1-1)  -- error f(x) = y
+   --print("errD_real Size:", errD_real:size())
    local df_do = one             -- df/dy  f(x) =y
+   --local errD_real = criterion:forward(output, label)
+   --local df_do = criterion:backward(output, label)
    netD:backward(input, df_do)
 
    -- train with fake
@@ -213,11 +228,15 @@ local fDx = function(x)
    label:fill(fake_label)
 
    local output = netD:forward(input)
-   local errD_fake = output     --log(1-D(G(X))*0+log(1-D(G(X))*(1-0) -- error f(x) = y
+   local errD_fake = torch.mean(output)   --log(1-D(G(X))*0+log(1-D(G(X))*(1-0) -- error f(x) = y
    local df_do = mone              -- df/dy  f(x)=1-y
+   --local errD_fake = criterion:forward(output, label)
+   --print("errD_fake Size:", errD_fake:size())
+   --local df_do = criterion:backward(output, label)
    netD:backward(input, df_do)
 
    errD = errD_real - errD_fake
+   --print("errD :", errD)
 
    return errD, gradParametersD
 end
@@ -234,8 +253,12 @@ local fGx = function(x)
    label:fill(real_label) -- fake labels are real for generator cost
 
    local output = netD.output -- netD:forward(input) was already executed in fDx, so save computation
-   errG = output              -- error f(x) = output y
+   errG = torch.mean(output)            -- error f(x) = output y
    local df_do = one            -- df/dy  f(x)=y
+   --errG = criterion:forward(output, label)
+   --print("errG :", errG)
+   --local df_do = criterion:backward(output, label)
+
    local df_dg = netD:updateGradInput(input, df_do)
 
    netG:backward(noise, df_dg)
@@ -243,6 +266,13 @@ local fGx = function(x)
 end
 
 ----------------------------------------------------------------------
+function math.Clamp(val, lower, upper)
+    assert(val and lower and upper, "not very useful error message here")
+    if lower > upper then lower, upper = upper, lower end -- swap if boundaries supplied the wrong way
+    return math.max(lower, math.min(upper, val))
+end
+
+-----------------------------------------------------------------
 --train
 
 local gen_iterations = 0
@@ -252,7 +282,8 @@ for epoch = 1, opt.niter do
    epoch_tm:reset()
    local counter = 0
 
-   for i = 1, math.min(data:size(), opt.ntrain), opt.batchSize do
+   local i = 1
+   while i < math.min(data:size()[1], opt.ntrain) do
       tm:reset()
 
       -- train the discriminator Diters times
@@ -264,22 +295,37 @@ for epoch = 1, opt.niter do
 
 
       local j = 0
-      while j < Diters do
+      while j < Diters and i < math.min(data:size()[1], opt.ntrain) do
          j = j + 1
 
          -- clamp parameters to a cube
-         for p in parametersD do
-            math.Clamp(p.data, opt.clamp_lower, opt.clamp_upper)
+         --print ("parametersD size:", parametersD:size(), "parametersD size 1:", parametersD:size(1))
+         --for p = 1, parametersD:size(1) do
+            --parametersD[p] = math.Clamp(parametersD[p], opt.clamp_lower, opt.clamp_upper)
+         --end
+
+         parametersD:clamp(opt.clamp_lower, opt.clamp_upper)
+
+         -- get minibatch input for real
+         data_tm:reset(); data_tm:resume()
+      
+         for k = 1, opt.batchSize do
+            local idx = math.min(i+k-1, data:size()[1])  --math.random(data:size()[1])
+            local sample = data[idx]     
+            input[k] = sample:clone()
          end
+         data_tm:stop()
+
+         i = i + opt.batchSize
 
          -- (1) Update D network: maximize (D(x)) - (D(G(z)))
-         optim.adam(fDx, parametersD, optimStateD)
+         optim.rmsprop(fDx, parametersD, optimStateD)
 
 
       end
 
       -- (2) Update G network: maximize (D(G(z))
-      optim.adam(fGx, parametersG, optimStateG)
+      optim.rmsprop(fGx, parametersG, optimStateG)
       gen_iterations = gen_iterations + 1
 
       -- display
@@ -296,9 +342,9 @@ for epoch = 1, opt.niter do
       -- logging
       if ((i-1) / opt.batchSize) % 1 == 0 then
          print(('Epoch: [%d][%8d / %8d]\t Time: %.3f  DataTime: %.3f  '
-                   .. '  Err_G: %.4f  Err_D: %.4f'):format(
+                   .. '  Err_G: %.4f  Err_D: %.4f '):format(
                  epoch, ((i-1) / opt.batchSize),
-                 math.floor(math.min(data:size(), opt.ntrain) / opt.batchSize),
+                 math.floor(math.min(data:size()[1], opt.ntrain) / opt.batchSize),
                  tm:time().real, data_tm:time().real,
                  errG and errG or -1, errD and errD or -1))
       end
